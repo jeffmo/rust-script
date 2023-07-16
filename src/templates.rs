@@ -5,11 +5,11 @@ use crate::error::{MainError, MainResult};
 use regex::Regex;
 use std::collections::HashMap;
 
-pub fn expand(src: &str, subs: &HashMap<&str, &str>) -> MainResult<String> {
+pub fn expand(src: &str, subs: &HashMap<&str, Vec<String>>) -> MainResult<String> {
     let re_sub = Regex::new(r#"#\{([A-Za-z_][A-Za-z0-9_]*)}"#).unwrap();
 
     // The estimate of final size is the sum of the size of all the input.
-    let sub_size = subs.iter().map(|(_, v)| v.len()).sum::<usize>();
+    let sub_size = subs.iter().map(|(_, v)| v.iter().map(|v| v.len()).sum::<usize>()).sum::<usize>();
     let est_size = src.len() + sub_size;
 
     let mut anchor = 0;
@@ -28,7 +28,11 @@ pub fn expand(src: &str, subs: &HashMap<&str, &str>) -> MainResult<String> {
         // Concat the substitution.
         let sub_name = m.get(1).unwrap().as_str();
         match subs.get(sub_name) {
-            Some(s) => result.push_str(s),
+            Some(srcs) => {
+                for src in srcs {
+                    result.push_str(src.as_str())
+                }
+            },
             None => {
                 return Err(MainError::OtherOwned(format!(
                     "substitution `{}` in template is unknown",

@@ -35,20 +35,20 @@ pub fn split_input(
     }
 
     let source_in_package = package_path.as_ref().join(script_name);
-    let (part_mani, source_path, source, template, sub_prelude) = match input {
+    let (part_mani, source_path, sources, template, sub_prelude) = match input {
         Input::File(_, path, content) => {
             assert_eq!(prelude_items.len(), 0);
             let content = strip_shebang(content);
-            let (manifest, source) =
-                find_embedded_manifest(content).unwrap_or((Manifest::Toml(""), content));
+            let (manifest, sources) =
+                find_embedded_manifest(content).unwrap_or((Manifest::Toml(""), vec![content]));
 
             if contains_main_method(content) {
-                (manifest, path.clone(), source.to_string(), None, false)
+                (manifest, path.clone(), sources.into_iter().map(|s| s.to_string()).collect(), None, false)
             } else {
                 (
                     manifest,
                     source_in_package,
-                    content.to_string(),
+                    vec![content.to_string()],
                     Some(consts::FILE_NO_MAIN_TEMPLATE),
                     false,
                 )
@@ -57,14 +57,14 @@ pub fn split_input(
         Input::Expr(content) => (
             Manifest::Toml(""),
             source_in_package,
-            content.to_string(),
+            vec![content.to_string()],
             Some(consts::EXPR_TEMPLATE),
             true,
         ),
         Input::Loop(content, count) => (
             Manifest::Toml(""),
             source_in_package,
-            content.to_string(),
+            vec![content.to_string()],
             Some(if *count {
                 consts::LOOP_COUNT_TEMPLATE
             } else {
@@ -75,9 +75,9 @@ pub fn split_input(
     };
 
     let mut prelude_str;
-    let mut subs = HashMap::with_capacity(2);
+    let mut subs: HashMap<&str, Vec<String>> = HashMap::with_capacity(2);
 
-    subs.insert(consts::SCRIPT_BODY_SUB, &source[..]);
+    subs.insert(consts::SCRIPT_BODY_SUB, sources);
 
     if sub_prelude {
         prelude_str =
@@ -86,7 +86,7 @@ pub fn split_input(
             prelude_str.push_str(i);
             prelude_str.push('\n');
         }
-        subs.insert(consts::SCRIPT_PRELUDE_SUB, &prelude_str[..]);
+        subs.insert(consts::SCRIPT_PRELUDE_SUB, vec![prelude_str]);
     }
 
     let source = template
@@ -134,7 +134,7 @@ fn test_split_input() {
     let toolchain = None;
     macro_rules! si {
         ($i:expr) => {
-            split_input(
+            Some(split_input(
                 &$i,
                 &[],
                 &[],
@@ -142,8 +142,7 @@ fn test_split_input() {
                 &bin_name,
                 &script_name,
                 toolchain.clone(),
-            )
-            .ok()
+            ).unwrap())
         };
     }
 
@@ -153,8 +152,8 @@ fn test_split_input() {
     };
 
     macro_rules! r {
-        ($m:expr, $p:expr, $r:expr) => {
-            Some(($m.into(), $p.into(), $r.into()))
+        ($mani_str:expr, $src_path:expr, $src:expr) => {
+            Some(($mani_str.into(), $src_path.into(), $src.into()))
         };
     }
 
@@ -438,6 +437,40 @@ fn main() -> Result<(), Box<dyn std::error::Error+Sync+Send>> {
             )
         )
     );
+
+    // Support multiple lines of `// cargo-deps: <<...>>` deplists
+    assert_eq!(
+        si!(f(r#"
+// Cargo-Deps: time="0.1.25", libc="0.2.5"
+// cargo-deps: foo
+// cargo-deps: bar="0.1.1", baz="0.2.3"
+fn main() {}
+"#)),
+        r!(
+            format!(
+                "{}{}",
+                r#"[[bin]]
+name = "binary-name"
+path = "/dummy/main.rs"
+
+[dependencies]
+bar = "0.1.1"
+baz = "0.2.3"
+foo = "*"
+libc = "0.2.5"
+time = "0.1.25"
+
+[package]
+authors = ["Anonymous"]
+edition = "2021"
+name = "n"
+version = "0.1.0""#,
+                STRIP_SECTION
+            ),
+            "/dummy/main.rs",
+            None
+        )
+    );
 }
 
 /**
@@ -462,7 +495,7 @@ enum Manifest<'s> {
     // TODO: Change to Cow<'s, str>.
     TomlOwned(String),
     /// The manifest is a comma-delimited list of dependencies.
-    DepList(&'s str),
+    DepList(Vec<&'s str>),
 }
 
 impl<'s> Manifest<'s> {
@@ -471,7 +504,7 @@ impl<'s> Manifest<'s> {
         match self {
             Toml(s) => toml::from_str(s),
             TomlOwned(ref s) => toml::from_str(s),
-            DepList(s) => Manifest::dep_list_to_toml(s),
+            DepList(deps) => Manifest::dep_list_to_toml(deps),
         }
         .map_err(|e| {
             MainError::Tag(
@@ -481,19 +514,21 @@ impl<'s> Manifest<'s> {
         })
     }
 
-    fn dep_list_to_toml(s: &str) -> ::std::result::Result<toml::value::Table, toml::de::Error> {
+    fn dep_list_to_toml(deplists: Vec<&str>) -> ::std::result::Result<toml::value::Table, toml::de::Error> {
         let mut r = String::new();
         r.push_str("[dependencies]\n");
-        for dep in s.trim().split(',') {
-            // If there's no version specified, add one.
-            match dep.contains('=') {
-                true => {
-                    r.push_str(dep);
-                    r.push('\n');
-                }
-                false => {
-                    r.push_str(dep);
-                    r.push_str("=\"*\"\n");
+        for deplist in deplists {
+            for dep in deplist.trim().split(',') {
+                // If there's no version specified, add one.
+                match dep.contains('=') {
+                    true => {
+                        r.push_str(dep);
+                        r.push('\n');
+                    }
+                    false => {
+                        r.push_str(dep);
+                        r.push_str("=\"*\"\n");
+                    }
                 }
             }
         }
@@ -507,7 +542,7 @@ Locates a manifest embedded in Rust source.
 
 Returns `Some((manifest, source))` if it finds a manifest, `None` otherwise.
 */
-fn find_embedded_manifest(s: &str) -> Option<(Manifest, &str)> {
+fn find_embedded_manifest(s: &str) -> Option<(Manifest, Vec<&str>)> {
     find_short_comment_manifest(s).or_else(|| find_code_block_manifest(s))
 }
 
@@ -570,10 +605,10 @@ fn main() {
 fn main() {}
 "),
         Some((
-            DepList(" time=\"0.1.25\""),
-            "// cargo-deps: time=\"0.1.25\"
+            DepList(vec![" time=\"0.1.25\""]),
+            vec!["// cargo-deps: time=\"0.1.25\"
 fn main() {}
-"
+"]
         ))
     );
 
@@ -582,10 +617,10 @@ fn main() {}
 fn main() {}
 "),
         Some((
-            DepList(" time=\"0.1.25\", libc=\"0.2.5\""),
-            "// cargo-deps: time=\"0.1.25\", libc=\"0.2.5\"
+            DepList(vec![" time=\"0.1.25\", libc=\"0.2.5\""]),
+            vec!["// cargo-deps: time=\"0.1.25\", libc=\"0.2.5\"
 fn main() {}
-"
+"]
         ))
     );
 
@@ -595,11 +630,11 @@ fn main() {}
 fn main() {}
 "),
         Some((
-            DepList(" time=\"0.1.25\"  "),
-            "
+            DepList(vec![" time=\"0.1.25\"  "]),
+            vec!["
   // cargo-deps: time=\"0.1.25\"  \n\
 fn main() {}
-"
+"]
         ))
     );
 
@@ -632,12 +667,12 @@ time = "0.1.25"
 "#
                 .into()
             ),
-            r#"//! ```Cargo
+            vec![r#"//! ```Cargo
 //! [dependencies]
 //! time = "0.1.25"
 //! ```
 fn main() {}
-"#
+"#]
         ))
     );
 
@@ -667,14 +702,14 @@ time = "0.1.25"
 "#
                 .into()
             ),
-            r#"/*!
+            vec![r#"/*!
 ```Cargo
 [dependencies]
 time = "0.1.25"
 ```
 */
 fn main() {}
-"#
+"#]
         ))
     );
 
@@ -704,14 +739,14 @@ time = "0.1.25"
 "#
                 .into()
             ),
-            r#"/*!
+            vec![r#"/*!
  * ```Cargo
  * [dependencies]
  * time = "0.1.25"
  * ```
  */
 fn main() {}
-"#
+"#]
         ))
     );
 }
@@ -719,15 +754,23 @@ fn main() {}
 /**
 Locates a "short comment manifest" in Rust source.
 */
-fn find_short_comment_manifest(s: &str) -> Option<(Manifest, &str)> {
-    let re: Regex = Regex::new(r"^(?i)\s*//\s*cargo-deps\s*:(.*?)(\r\n|\n)").unwrap();
+fn find_short_comment_manifest(s: &str) -> Option<(Manifest, Vec<&str>)> {
+    let re: Regex = Regex::new(r"(?im)^\s*//\s*cargo-deps\s*:(.*?)(\r\n|\n)").unwrap();
     /*
     This is pretty simple: the only valid syntax for this is for the first, non-blank line to contain a single-line comment whose first token is `cargo-deps:`.  That's it.
     */
-    if let Some(cap) = re.captures(s) {
-        if let Some(m) = cap.get(1) {
-            return Some((Manifest::DepList(m.as_str()), s));
+    let mut deplists = vec![];
+    let mut srcs = vec![];
+    let caps_iter = re.captures_iter(s);
+    for cap in caps_iter {
+        if let Some(match_) = cap.get(1) {
+            println!("match: {}", match_.as_str());
+            deplists.push(match_.as_str());
+            srcs.push(s);
         }
+    }
+    if deplists.len () > 0 {
+        return Some((Manifest::DepList(deplists), srcs));
     }
     None
 }
@@ -735,7 +778,7 @@ fn find_short_comment_manifest(s: &str) -> Option<(Manifest, &str)> {
 /**
 Locates a "code block manifest" in Rust source.
 */
-fn find_code_block_manifest(s: &str) -> Option<(Manifest, &str)> {
+fn find_code_block_manifest(s: &str) -> Option<(Manifest, Vec<&str>)> {
     let re_crate_comment: Regex = {
         Regex::new(
             r"(?x)
@@ -770,7 +813,7 @@ fn find_code_block_manifest(s: &str) -> Option<(Manifest, &str)> {
         }
     };
 
-    scrape_markdown_manifest(&comment).map(|m| (Manifest::TomlOwned(m), s))
+    scrape_markdown_manifest(&comment).map(|m| (Manifest::TomlOwned(m), vec![s]))
 }
 
 /**
